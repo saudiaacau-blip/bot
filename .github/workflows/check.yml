@@ -44,7 +44,10 @@ jobs:
         run: |
           python bot.py
 
+      # always(): если часть сообщений ушла, а потом случился сбой, прогресс
+      # всё равно нужно сохранить, иначе уже отправленное придёт повторно.
       - name: Commit state
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
