@@ -20,6 +20,8 @@ from config import (
     BLOCKED_KEYWORDS,
 )
 
+import requests
+
 from github_api import GitHub
 from telegram_api import Telegram
 from parser import parse_appid, parse_name
@@ -280,6 +282,118 @@ def is_tracked(path):
 
 
 # --------------------------------------------------------
+# Отправка (без глушения ошибок!)
+# --------------------------------------------------------
+
+def notify(msg):
+
+    # Любая ошибка Telegram пробрасывается наверх: коммит считается
+    # необработанным, state.json не сдвигается, запуск помечается красным
+    # и при следующем запуске отправка повторится. Раньше ошибка тихо
+    # печаталась, state.json уходил вперёд и сообщения терялись навсегда.
+    telegram.send(msg, parse_mode="HTML")
+    print(msg)
+
+    # Небольшая пауза между сообщениями (flood control Telegram).
+    time.sleep(1)
+
+
+def raw_or_empty(path, ref):
+
+    # "Файла не было в родительском коммите" - это только 404. Любую другую
+    # ошибку (сеть, 5xx, лимиты) нельзя считать "файл пуст": иначе вся
+    # история из тысяч строк была бы принята за новые строки и отправлена.
+    try:
+        return github.raw(path, ref)
+
+    except requests.HTTPError as e:
+
+        if e.response is not None and e.response.status_code == 404:
+            return ""
+
+        raise
+
+
+# --------------------------------------------------------
+# Обработка одного коммита
+# --------------------------------------------------------
+
+def process_commit(commit):
+
+    sha = commit["sha"]
+
+    parents = commit.get("parents") or []
+
+    if not parents:
+        print(f"Skipping {sha}: no parent commit")
+        return
+
+    parent_sha = parents[0]["sha"]
+
+    files = github.commit(sha).get("files", [])
+
+    paths = [file["filename"] for file in files]
+
+    # Если коммит тронул файл истории, то все версии из него придут
+    # строками истории. Отдельно разбирать json-файлы в таком коммите не
+    # нужно: это давало дубли (одно и то же обновление приходило дважды).
+    history_touched = any(path in HISTORY_FILES for path in paths)
+
+    for path in paths:
+
+        if path in HISTORY_FILES:
+
+            old_text = raw_or_empty(path, parent_sha)
+            new_text = github.raw(path, sha)
+
+            for line in added_lines(old_text, new_text):
+
+                if is_blocked(line):
+                    print(f"Пропущено (стоп-слово): {line}")
+                    continue
+
+                notify(make_history_message(line))
+
+            continue
+
+        if history_touched:
+            continue
+
+        if not is_tracked(path):
+            continue
+
+        try:
+            old_text = github.raw(path, parent_sha)
+            new_text = github.raw(path, sha)
+
+        except Exception as e:
+            print("RAW ERROR:", e)
+            continue
+
+        old_version = find_version(old_text)
+        new_version = find_version(new_text)
+
+        if old_version is None or new_version is None:
+            continue
+
+        if old_version == new_version:
+            continue
+
+        msg = make_message(
+            path,
+            old_version,
+            new_version,
+            format_time(commit["commit"]["author"]["date"])
+        )
+
+        if is_blocked(msg) or is_blocked(parse_name(parse_appid(path))):
+            print(f"Пропущено (стоп-слово): {path}")
+            continue
+
+        notify(msg)
+
+
+# --------------------------------------------------------
 # Main
 # --------------------------------------------------------
 
@@ -306,102 +420,40 @@ def main():
 
     print(f"Found commits: {len(commits)}")
 
+    # Последний ПОЛНОСТЬЮ обработанный коммит. Пока ничего не обработано,
+    # состояние остаётся прежним.
+    last_ok = state.get("last_commit") or ""
+
+    failed = False
+
     for commit in commits:
 
-        sha = commit["sha"]
+        try:
+            process_commit(commit)
 
-        commit_data = github.commit(sha)
-
-        files = commit_data.get("files", [])
-
-        parents = commit.get("parents") or []
-
-        if not parents:
-            print(f"Skipping {sha}: no parent commit")
-            continue
-
-        parent_sha = parents[0]["sha"]
-
-        for file in files:
-
-            path = file["filename"]
-
-            if path in HISTORY_FILES:
-
-                try:
-                    # Файла могло не быть в родительском коммите (например,
-                    # это самый первый коммит с ним) - тогда считаем, что
-                    # "было" пусто.
-                    old_text = github.raw(path, parent_sha)
-                except Exception:
-                    old_text = ""
-
-                try:
-                    new_text = github.raw(path, sha)
-                except Exception as e:
-                    print("RAW ERROR:", e)
-                    continue
-
-                for line in added_lines(old_text, new_text):
-
-                    msg = make_history_message(line)
-
-                    if is_blocked(line):
-                        print(f"Пропущено (стоп-слово): {line}")
-                        continue
-
-                    try:
-                        telegram.send(msg, parse_mode="HTML")
-                        print(msg)
-                    except Exception as e:
-                        print("TELEGRAM ERROR:", e)
-
-                    # Небольшая пауза между сообщениями, чтобы не словить
-                    # flood control от Telegram, если строк добавилось
-                    # сразу несколько.
-                    time.sleep(1)
-
-                continue
-
-            if not is_tracked(path):
-                continue
-
-            try:
-                old_text = github.raw(path, parent_sha)
-                new_text = github.raw(path, sha)
-
-            except Exception as e:
-                print("RAW ERROR:", e)
-                continue
-
-            old_version = find_version(old_text)
-            new_version = find_version(new_text)
-
-            if old_version is None or new_version is None:
-                continue
-
-            if old_version == new_version:
-                continue
-
-            msg = make_message(
-                path,
-                old_version,
-                new_version,
-                format_time(commit["commit"]["author"]["date"])
+        except Exception as e:
+            print(
+                f"::error::Не удалось обработать коммит {commit['sha']}: {e}",
+                file=sys.stderr
             )
+            failed = True
+            break
 
-            if is_blocked(msg) or is_blocked(parse_name(parse_appid(path))):
-                print(f"Пропущено (стоп-слово): {path}")
-                continue
+        last_ok = commit["sha"]
 
-            try:
-                telegram.send(msg, parse_mode="HTML")
-                print(msg)
-            except Exception as e:
-                print("TELEGRAM ERROR:", e)
+    # Сдвигаем состояние только до последнего обработанного коммита (а не
+    # до latest_sha): так ничего не теряется ни при сбое отправки, ни когда
+    # GitHub отдал в сравнении только часть коммитов (по умолчанию 30) -
+    # остальные будут обработаны на следующем запуске.
+    if commits:
+        state["last_commit"] = last_ok
+    else:
+        state["last_commit"] = latest_sha
 
-    state["last_commit"] = latest_sha
     save_state(state)
+
+    if failed:
+        sys.exit(1)
 
     print("Done.")
 
@@ -410,10 +462,12 @@ if __name__ == "__main__":
 
     try:
         main()
+
+    except SystemExit:
+        raise
+
     except Exception as e:
         # Явно завершаем с ошибкой, чтобы GitHub Actions пометил запуск
-        # как failed и это было видно во вкладке Actions, а не терялось
-        # молча (раньше при любой ошибке state.json просто не обновлялся,
-        # без внятного сообщения о причине).
+        # как failed и это было видно во вкладке Actions.
         print(f"::error::Bot crashed: {e}", file=sys.stderr)
         sys.exit(1)
